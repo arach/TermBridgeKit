@@ -1,0 +1,140 @@
+import AppKit
+import GhosttyKit
+
+/// Minimal wrapper around libghostty runtime so we can create surfaces and tick the engine.
+@MainActor
+final class TermBridgeKitRuntime: ObservableObject {
+    static let shared = TermBridgeKitRuntime()
+
+    private let config: ghostty_config_t?
+    private(set) var app: ghostty_app_t?
+
+    /// Timer to drive periodic ticks in case the runtime doesn't wake us up.
+    private var tickTimer: Timer?
+    private var notificationTokens: [NSObjectProtocol] = []
+    private let debugInputLogging = ProcessInfo.processInfo.environment["TERMBRIDGEKIT_DEBUG_INPUT"] == "1"
+
+    private init() {
+        // SPM executables default to `.prohibited`, which blocks keyboard focus.
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
+        if debugInputLogging {
+            NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { event in
+                NSLog("[TermBridgeKitRuntime] global monitor saw \(event.type == .keyDown ? "down" : "up") keyCode=\(event.keyCode) mods=0x\(String(event.modifierFlags.rawValue, radix: 16)) windowKey=\(event.window?.isKeyWindow == true) appActive=\(NSApp.isActive)")
+                return event
+            }
+        }
+
+        // libghostty requires global init prior to any other calls.
+        let initResult = ghostty_init(0, nil)
+        guard initResult == GHOSTTY_SUCCESS else {
+            assertionFailure("ghostty_init failed with code \(initResult)")
+            self.config = nil
+            return
+        }
+
+        // Prepare configuration with defaults.
+        self.config = ghostty_config_new()
+        guard let config else {
+            return
+        }
+
+        ghostty_config_load_default_files(config)
+        ghostty_config_finalize(config)
+
+        // Build runtime callbacks.
+        var runtime = ghostty_runtime_config_s(
+            userdata: Unmanaged.passUnretained(self).toOpaque(),
+            supports_selection_clipboard: false,
+            wakeup_cb: { userdata in
+                TermBridgeKitRuntime.wakeup(userdata)
+            },
+            action_cb: { app, target, action in
+                TermBridgeKitRuntime.handleAction(app: app, target: target, action: action)
+            },
+            read_clipboard_cb: { _, _, _ in },
+            confirm_read_clipboard_cb: { _, _, _, _ in },
+            write_clipboard_cb: { _, _, _, _, _ in },
+            close_surface_cb: { _, _ in }
+        )
+
+        // Create the Ghostty app.
+        self.app = ghostty_app_new(&runtime, config)
+        if let app {
+            ghostty_app_set_focus(app, NSApp.isActive)
+        }
+
+        // Kick off a gentle tick loop so background work proceeds.
+        startTickLoop()
+
+        // Bring our app forward so keystrokes go to the window when launched via `swift run`.
+        NSApp.activate(ignoringOtherApps: true)
+        observeAppFocus()
+    }
+
+    deinit {
+        notificationTokens.forEach(NotificationCenter.default.removeObserver)
+        tickTimer?.invalidate()
+        if let app {
+            ghostty_app_free(app)
+        }
+        if let config {
+            ghostty_config_free(config)
+        }
+    }
+
+    // MARK: - Callbacks
+
+    private static func wakeup(_ userdata: UnsafeMutableRawPointer?) {
+        guard let userdata else { return }
+        let runtime = Unmanaged<TermBridgeKitRuntime>.fromOpaque(userdata).takeUnretainedValue()
+        runtime.tick()
+    }
+
+    private static func handleAction(
+        app: ghostty_app_t?,
+        target: ghostty_target_s,
+        action: ghostty_action_s
+    ) -> Bool {
+        // For now we acknowledge all actions without special handling.
+        return true
+    }
+
+    // MARK: - Ticking
+
+    func tick() {
+        guard let app else { return }
+        ghostty_app_tick(app)
+    }
+
+    private func startTickLoop() {
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.tick()
+            }
+        }
+    }
+
+    private func observeAppFocus() {
+        let center = NotificationCenter.default
+        let become = center.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, let app = self.app else { return }
+            ghostty_app_set_focus(app, true)
+        }
+        let resign = center.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, let app = self.app else { return }
+            ghostty_app_set_focus(app, false)
+        }
+        notificationTokens.append(contentsOf: [become, resign])
+    }
+
+}
