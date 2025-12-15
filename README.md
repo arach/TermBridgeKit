@@ -1,28 +1,24 @@
 # TermBridgeKit
 
-TermBridgeKit is a thin embedding layer that lets you drop a native terminal surface into a macOS SwiftUI app. It currently ships with Ghostty's runtime (`GhosttyKit.xcframework`) but is intentionally positioned as a general bridge so we can follow Ghostty's direction—and, if needed, pivot to other backends—without pretending to be "just a Ghostty wrapper."
+Drop a native terminal surface into a macOS SwiftUI app. Uses Ghostty today, but the SwiftUI API is kept small so the backend can change later.
 
 ## Requirements
 - macOS 14+
 - Swift 5.9 / Xcode 15+
-- `GhosttyKit.xcframework` available at `vendor/ghostty/macos/GhosttyKit.xcframework`
+- `vendor/ghostty/macos/GhosttyKit.xcframework` (git-ignored)
 
-## Getting GhosttyKit
-TermBridgeKit does not ship Ghostty binaries. Build `GhosttyKit.xcframework` directly from the Ghostty project (follow their embed instructions), then install it into this repo:
-
-1) Clone Ghostty (or point to your existing checkout).  
-2) Follow Ghostty's documented steps to build `GhosttyKit.xcframework` for macOS.  
-3) Copy the resulting framework into place:
+## Get GhosttyKit
+This repo does not ship Ghostty binaries. Build `GhosttyKit.xcframework` from the Ghostty project, then copy it in:
 
 ```sh
-# Example: after building GhosttyKit.xcframework from the Ghostty repo
+# After building GhosttyKit.xcframework from Ghostty's embed instructions
 ./scripts/install-ghosttykit.sh /path/to/GhosttyKit.xcframework
 ```
 
-The install script simply copies the framework into `vendor/ghostty/macos`, which is git-ignored.
+The script just copies the framework into `vendor/ghostty/macos`.
 
 ## Usage
-Add TermBridgeKit to your project (via SPM or a local checkout) and render the SwiftUI view:
+Add TermBridgeKit via SPM or as a local checkout, then render the view:
 
 ```swift
 import SwiftUI
@@ -36,11 +32,9 @@ struct TerminalPane: View {
 }
 ```
 
-Set `TERMBRIDGEKIT_DEBUG_INPUT=1` when running if you want verbose keyboard/mouse logging.
+Set `TERMBRIDGEKIT_DEBUG_INPUT=1` to log keyboard/mouse events.
 
 ## Demo
-Run the bundled sample app to see the terminal surface embedded under a bit of host UI chrome:
-
 ```sh
 swift run TermBridgeKitDemo
 ```
