@@ -1,16 +1,36 @@
+#if canImport(AppKit)
+
 import AppKit
 import SwiftUI
 import GhosttyKit
 
 /// SwiftUI wrapper that embeds the live Ghostty surface.
 public struct TermBridgeKitSurfaceView: NSViewRepresentable {
-    public init() {}
+    private let controller: TermBridgeKitTerminalController?
+    private let showsSystemKeyboard: Bool
+    private let fontSize: Double?
 
-    public func makeNSView(context: Context) -> SurfaceContainerView {
-        SurfaceContainerView(runtime: .shared)
+    public init(
+        controller: TermBridgeKitTerminalController? = nil,
+        showsSystemKeyboard: Bool = true,
+        fontSize: Double? = nil
+    ) {
+        self.controller = controller
+        self.showsSystemKeyboard = showsSystemKeyboard
+        self.fontSize = fontSize
     }
 
-    public func updateNSView(_ nsView: SurfaceContainerView, context: Context) {}
+    public func makeNSView(context: Context) -> SurfaceContainerView {
+        let view = SurfaceContainerView(runtime: .shared)
+        view.preferredFontSize = fontSize
+        view.bind(controller: controller)
+        return view
+    }
+
+    public func updateNSView(_ nsView: SurfaceContainerView, context: Context) {
+        nsView.preferredFontSize = fontSize
+        nsView.bind(controller: controller)
+    }
 }
 
 /// NSView subclass that holds the Ghostty surface and forwards basic input.
@@ -20,9 +40,12 @@ public final class SurfaceContainerView: NSView {
     private var renderTimer: Timer?
     private var trackingArea: NSTrackingArea?
     private var keyMonitor: Any?
+    private weak var controller: TermBridgeKitTerminalController?
+    private var lastReportedSize: TermBridgeKitTerminalSize?
     private let debugInputLogging = ProcessInfo.processInfo.environment["TERMBRIDGEKIT_DEBUG_INPUT"] == "1"
     private var lastMouseLog: TimeInterval = 0
     private let mouseLogInterval: TimeInterval = 0.05
+    var preferredFontSize: Double?
 
     init(runtime: TermBridgeKitRuntime) {
         self.runtime = runtime
@@ -113,6 +136,7 @@ public final class SurfaceContainerView: NSView {
         ghostty_surface_set_size(surface, width, height)
         ghostty_surface_refresh(surface)
         ghostty_surface_draw(surface)
+        reportSizeIfNeeded()
     }
 
     // MARK: Rendering
@@ -137,7 +161,7 @@ public final class SurfaceContainerView: NSView {
             nsview: Unmanaged.passUnretained(self).toOpaque()
         ))
         cfg.scale_factor = Double(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0)
-        cfg.font_size = 0
+        cfg.font_size = Float(preferredFontSize ?? 0)
         cfg.wait_after_command = false
 
         guard let created = ghostty_surface_new(app, &cfg) else { return }
@@ -146,6 +170,7 @@ public final class SurfaceContainerView: NSView {
         updateSurfaceSize()
         ghostty_surface_refresh(created)
         ghostty_surface_draw(created)
+        reportSizeIfNeeded()
         if renderTimer == nil {
             startRenderLoop()
         }
@@ -156,6 +181,102 @@ public final class SurfaceContainerView: NSView {
         ghostty_surface_set_focus(surface, focused)
     }
 
+    func handleTransportWrite(_ data: Data) {
+        controller?.forwardTransportWrite(data)
+    }
+
+    func bind(controller: TermBridgeKitTerminalController?) {
+        self.controller = controller
+        controller?.bind(
+            processRemoteOutput: { [weak self] data in
+                self?.processRemoteOutput(data)
+            },
+            focus: { [weak self] in
+                self?.bringToFrontAndFocus()
+            },
+            blur: { [weak self] in
+                self?.window?.makeFirstResponder(nil)
+            },
+            currentSize: { [weak self] in
+                self?.currentTerminalSize()
+            },
+            visibleText: { [weak self] in
+                self?.visibleTerminalText()
+            },
+            diagnostics: {
+                nil
+            }
+        )
+        reportSizeIfNeeded()
+    }
+
+    private func processRemoteOutput(_ data: Data) {
+        guard let surface, !data.isEmpty else { return }
+        data.withUnsafeBytes { buffer in
+            guard let ptr = buffer.bindMemory(to: CChar.self).baseAddress else { return }
+            ghostty_surface_process_output(surface, ptr, UInt(data.count))
+        }
+        ghostty_surface_refresh(surface)
+        ghostty_surface_draw(surface)
+    }
+
+    private func currentTerminalSize() -> TermBridgeKitTerminalSize? {
+        guard let surface else { return nil }
+        let size = ghostty_surface_size(surface)
+        return TermBridgeKitTerminalSize(
+            columns: Int(size.columns),
+            rows: Int(size.rows),
+            cellWidthPixels: Int(size.cell_width_px),
+            cellHeightPixels: Int(size.cell_height_px)
+        )
+    }
+
+    private func reportSizeIfNeeded() {
+        guard let size = currentTerminalSize() else { return }
+        guard size != lastReportedSize else { return }
+        lastReportedSize = size
+        controller?.reportSizeChanged(size)
+    }
+
+    private func visibleTerminalText() -> String? {
+        guard let surface, let size = currentTerminalSize() else { return nil }
+        guard size.columns > 0, size.rows > 0 else { return nil }
+
+        var text = ghostty_text_s(
+            tl_px_x: 0,
+            tl_px_y: 0,
+            offset_start: 0,
+            offset_len: 0,
+            text: nil,
+            text_len: 0
+        )
+
+        let selection = ghostty_selection_s(
+            top_left: ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: 0,
+                y: 0
+            ),
+            bottom_right: ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: UInt32(max(size.columns - 1, 0)),
+                y: UInt32(max(size.rows - 1, 0))
+            ),
+            rectangle: false
+        )
+
+        guard ghostty_surface_read_text(surface, selection, &text),
+              let base = text.text else {
+            return nil
+        }
+
+        defer { ghostty_surface_free_text(surface, &text) }
+        let data = Data(bytes: base, count: Int(text.text_len))
+        return String(decoding: data, as: UTF8.self)
+    }
+
     // MARK: Input
 
     public override func keyDown(with event: NSEvent) {
@@ -164,6 +285,17 @@ public final class SurfaceContainerView: NSView {
 
     public override func keyUp(with event: NSEvent) {
         sendKeyEvent(event, action: GHOSTTY_ACTION_RELEASE)
+    }
+
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        guard window?.firstResponder === self else { return false }
+        guard event.modifierFlags.contains(.command),
+              event.charactersIgnoringModifiers?.lowercased() == "v" else {
+            return false
+        }
+
+        return pasteFromClipboard()
     }
 
     private func modsFromFlags(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
@@ -338,7 +470,13 @@ public final class SurfaceContainerView: NSView {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             guard let self else { return event }
+            guard event.window == self.window, self.window?.firstResponder === self else {
+                return event
+            }
             self.logInput("monitor saw \(event.type == .keyDown ? "down" : "up") keyCode=\(event.keyCode) mods=0x\(String(self.modsFromFlags(event.modifierFlags).rawValue, radix: 16)) isKeyWindow=\(self.window?.isKeyWindow == true) firstResponder=\(String(describing: self.window?.firstResponder))")
+            if event.modifierFlags.contains(.command) {
+                return event
+            }
             switch event.type {
             case .keyDown:
                 self.sendKeyEvent(event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
@@ -367,4 +505,70 @@ public final class SurfaceContainerView: NSView {
             NSLog("[TermBridgeKitSurface] \(message)")
         }
     }
+
+    // MARK: Clipboard
+
+    @IBAction public func paste(_ sender: Any?) {
+        _ = pasteFromClipboard()
+    }
+
+    @IBAction public func pasteAsPlainText(_ sender: Any?) {
+        _ = pasteFromClipboard()
+    }
+
+    func readClipboard(
+        location: ghostty_clipboard_e,
+        state: UnsafeMutableRawPointer?
+    ) -> Bool {
+        guard let pasteboard = pasteboard(for: location),
+              let string = pasteboardString(from: pasteboard) else {
+            return false
+        }
+
+        completeClipboardRequest(string, state: state)
+        return true
+    }
+
+    func completeClipboardRequest(
+        _ string: String,
+        state: UnsafeMutableRawPointer?,
+        confirmed: Bool = false
+    ) {
+        guard let surface else { return }
+        string.withCString { ptr in
+            ghostty_surface_complete_clipboard_request(surface, ptr, state, confirmed)
+        }
+    }
+
+    private func pasteFromClipboard() -> Bool {
+        guard let surface else { return false }
+        let action = "paste_from_clipboard"
+        let success = ghostty_surface_binding_action(
+            surface,
+            action,
+            UInt(action.lengthOfBytes(using: .utf8))
+        )
+        logInput("paste_from_clipboard \(success ? "succeeded" : "failed")")
+        return success
+    }
+
+    private func pasteboard(for location: ghostty_clipboard_e) -> NSPasteboard? {
+        switch location {
+        case GHOSTTY_CLIPBOARD_STANDARD:
+            return .general
+        default:
+            return nil
+        }
+    }
+
+    private func pasteboardString(from pasteboard: NSPasteboard) -> String? {
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL],
+           !urls.isEmpty {
+            return urls.map(\.path).joined(separator: " ")
+        }
+
+        return pasteboard.string(forType: .string)
+    }
 }
+
+#endif
