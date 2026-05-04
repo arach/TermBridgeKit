@@ -1,0 +1,520 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index b0395b89e..3328db6cb 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -898,7 +898,7 @@ typedef struct {
+ } ghostty_action_s;
+ 
+ typedef void (*ghostty_runtime_wakeup_cb)(void*);
+-typedef void (*ghostty_runtime_read_clipboard_cb)(void*,
++typedef bool (*ghostty_runtime_read_clipboard_cb)(void*,
+                                                   ghostty_clipboard_e,
+                                                   void*);
+ typedef void (*ghostty_runtime_confirm_read_clipboard_cb)(
+@@ -911,6 +911,7 @@ typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
+                                                    const ghostty_clipboard_content_s*,
+                                                    size_t,
+                                                    bool);
++typedef void (*ghostty_runtime_write_to_host_cb)(void*, const uint8_t*, size_t);
+ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
+ typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
+                                           ghostty_target_s,
+@@ -924,6 +925,7 @@ typedef struct {
+   ghostty_runtime_read_clipboard_cb read_clipboard_cb;
+   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
+   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
++  ghostty_runtime_write_to_host_cb write_to_host_cb;
+   ghostty_runtime_close_surface_cb close_surface_cb;
+ } ghostty_runtime_config_s;
+ 
+@@ -973,6 +975,12 @@ void ghostty_config_load_cli_args(ghostty_config_t);
+ void ghostty_config_load_default_files(ghostty_config_t);
+ void ghostty_config_load_recursive_files(ghostty_config_t);
+ void ghostty_config_finalize(ghostty_config_t);
++void ghostty_config_set_font_size(ghostty_config_t, float);
++bool ghostty_config_set_font_family(ghostty_config_t,
++                                    const char*,
++                                    uintptr_t);
++uint32_t ghostty_config_font_family_count(ghostty_config_t);
++const char* ghostty_config_font_family_get(ghostty_config_t, uint32_t);
+ bool ghostty_config_get(ghostty_config_t, void*, const char*, uintptr_t);
+ ghostty_input_trigger_s ghostty_config_trigger(ghostty_config_t,
+                                                const char*,
+@@ -1022,6 +1030,7 @@ void ghostty_surface_commands(ghostty_surface_t, ghostty_command_s**, size_t*);
+ bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);
+ bool ghostty_surface_key_is_binding(ghostty_surface_t, ghostty_input_key_s);
+ void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
++void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+ void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+ bool ghostty_surface_mouse_captured(ghostty_surface_t);
+ bool ghostty_surface_mouse_button(ghostty_surface_t,
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 19c2662c1..fccd2e27a 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -607,28 +607,36 @@ pub fn init(
+         };
+         errdefer env.deinit();
+ 
+-        // Initialize our IO backend
+-        var io_exec = try termio.Exec.init(alloc, .{
+-            .command = command,
+-            .env = env,
+-            .env_override = config.env,
+-            .shell_integration = config.@"shell-integration",
+-            .shell_integration_features = config.@"shell-integration-features",
+-            .working_directory = config.@"working-directory",
+-            .resources_dir = global_state.resources_dir.host(),
+-            .term = config.term,
+-
+-            // Get the cgroup if we're on linux and have the decl. I'd love
+-            // to change this from a decl to a surface options struct because
+-            // then we can do memory management better (don't need to retain
+-            // the string around).
+-            .linux_cgroup = if (comptime builtin.os.tag == .linux and
+-                @hasDecl(apprt.runtime.Surface, "cgroup"))
+-                rt_surface.cgroup()
+-            else
+-                Command.linux_cgroup_default,
+-        });
+-        errdefer io_exec.deinit();
++        const io_backend = io_backend: {
++            if (comptime @hasDecl(apprt.runtime.Surface, "termioBackend")) {
++                if (rt_surface.termioBackend()) |backend| {
++                    break :io_backend backend;
++                }
++            }
++
++            var io_exec = try termio.Exec.init(alloc, .{
++                .command = command,
++                .env = env,
++                .env_override = config.env,
++                .shell_integration = config.@"shell-integration",
++                .shell_integration_features = config.@"shell-integration-features",
++                .working_directory = config.@"working-directory",
++                .resources_dir = global_state.resources_dir.host(),
++                .term = config.term,
++
++                // Get the cgroup if we're on linux and have the decl. I'd love
++                // to change this from a decl to a surface options struct because
++                // then we can do memory management better (don't need to retain
++                // the string around).
++                .linux_cgroup = if (comptime builtin.os.tag == .linux and
++                    @hasDecl(apprt.runtime.Surface, "cgroup"))
++                    rt_surface.cgroup()
++                else
++                    Command.linux_cgroup_default,
++            });
++            errdefer io_exec.deinit();
++            break :io_backend termio.Backend{ .exec = io_exec };
++        };
+ 
+         // Initialize our IO mailbox
+         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+@@ -638,7 +646,7 @@ pub fn init(
+             .size = size,
+             .full_config = config,
+             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+-            .backend = .{ .exec = io_exec },
++            .backend = io_backend,
+             .mailbox = io_mailbox,
+             .renderer_state = &self.renderer_state,
+             .renderer_wakeup = render_thread.wakeup,
+@@ -1273,6 +1281,7 @@ fn childExitedAbnormally(
+     // Build up our command for the error message
+     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
+         .exec => |*exec| exec.subprocess.args,
++        .host => &[_][]const u8{"embedding host"},
+     });
+     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
+ 
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index da7a585a5..b0a713235 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -20,6 +20,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
+ const CoreSurface = @import("../Surface.zig");
+ const configpkg = @import("../config.zig");
+ const Config = configpkg.Config;
++const termio = @import("../termio.zig");
+ 
+ const log = std.log.scoped(.embedded_window);
+ 
+@@ -53,7 +54,7 @@ pub const App = struct {
+         /// Read the clipboard value. The return value must be preserved
+         /// by the host until the next call. If there is no valid clipboard
+         /// value then this should return null.
+-        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) void,
++        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) bool,
+ 
+         /// This may be called after a read clipboard call to request
+         /// confirmation that the clipboard value is safe to read. The embedder
+@@ -74,6 +75,9 @@ pub const App = struct {
+             bool,
+         ) callconv(.c) void,
+ 
++        /// Write bytes back to the embedding host instead of to a pty.
++        write_to_host: ?*const fn (SurfaceUD, [*]const u8, usize) callconv(.c) void = null,
++
+         /// Close the current surface given by this function.
+         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+     };
+@@ -662,11 +666,12 @@ pub const Surface = struct {
+         errdefer alloc.destroy(state_ptr);
+         state_ptr.* = state;
+ 
+-        self.app.opts.read_clipboard(
++        const accepted = self.app.opts.read_clipboard(
+             self.userdata,
+             @intCast(@intFromEnum(clipboard_type)),
+             state_ptr,
+         );
++        if (!accepted) alloc.destroy(state_ptr);
+     }
+ 
+     fn completeClipboardRequest(
+@@ -932,6 +937,15 @@ pub const Surface = struct {
+         return env;
+     }
+ 
++    pub fn termioBackend(self: *const Surface) ?termio.Backend {
++        const write_to_host = self.app.opts.write_to_host orelse return null;
++
++        return .{ .host = termio.Host.init(.{
++            .userdata = self.userdata,
++            .write = write_to_host,
++        }) };
++    }
++
+     /// The cursor position from the host directly is in screen coordinates but
+     /// all our interface works in pixels.
+     fn cursorPosToPixels(self: *const Surface, pos: apprt.CursorPos) !apprt.CursorPos {
+@@ -1760,6 +1774,15 @@ pub const CAPI = struct {
+         surface.textCallback(ptr[0..len]);
+     }
+ 
++    /// Process output from a host-owned transport.
++    export fn ghostty_surface_process_output(
++        surface: *Surface,
++        ptr: [*]const u8,
++        len: usize,
++    ) void {
++        surface.core_surface.io.processOutput(ptr[0..len]);
++    }
++
+     /// Set the preedit text for the surface. This is used for IME
+     /// composition. If the length is 0, then the preedit text is cleared.
+     export fn ghostty_surface_preedit(
+diff --git a/src/build/GhosttyXCFramework.zig b/src/build/GhosttyXCFramework.zig
+index 3afeb9073..eb9c272d7 100644
+--- a/src/build/GhosttyXCFramework.zig
++++ b/src/build/GhosttyXCFramework.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const Config = @import("Config.zig");
+ const SharedDeps = @import("SharedDeps.zig");
+ const GhosttyLib = @import("GhosttyLib.zig");
++const LipoStep = @import("LipoStep.zig");
+ const XCFrameworkStep = @import("XCFrameworkStep.zig");
+ const Target = @import("xcframework.zig").Target;
+ 
+@@ -36,7 +37,7 @@ pub fn init(
+     ));
+ 
+     // iOS Simulator
+-    const ios_sim = try GhosttyLib.initStatic(b, &try deps.retarget(
++    const ios_sim_arm64 = try GhosttyLib.initStatic(b, &try deps.retarget(
+         b,
+         b.resolveTargetQuery(.{
+             .cpu_arch = .aarch64,
+@@ -53,6 +54,23 @@ pub fn init(
+         }),
+     ));
+ 
++    const ios_sim_x86_64 = try GhosttyLib.initStatic(b, &try deps.retarget(
++        b,
++        b.resolveTargetQuery(.{
++            .cpu_arch = .x86_64,
++            .os_tag = .ios,
++            .os_version_min = Config.osVersionMin(.ios),
++            .abi = .simulator,
++        }),
++    ));
++
++    const ios_sim_universal = LipoStep.create(b, .{
++        .name = "ghostty-ios-simulator",
++        .out_name = "libghostty-fat.a",
++        .input_a = ios_sim_arm64.output,
++        .input_b = ios_sim_x86_64.output,
++    });
++
+     // The xcframework wraps our ghostty library so that we can link
+     // it to the final app built with Swift.
+     const xcframework = XCFrameworkStep.create(b, .{
+@@ -71,9 +89,9 @@ pub fn init(
+                     .dsym = ios.dsym,
+                 },
+                 .{
+-                    .library = ios_sim.output,
++                    .library = ios_sim_universal.output,
+                     .headers = b.path("include"),
+-                    .dsym = ios_sim.dsym,
++                    .dsym = null,
+                 },
+             },
+ 
+diff --git a/src/config/CApi.zig b/src/config/CApi.zig
+index a970a8d33..1f4cd2e55 100644
+--- a/src/config/CApi.zig
++++ b/src/config/CApi.zig
+@@ -80,6 +80,36 @@ export fn ghostty_config_finalize(self: *Config) void {
+     };
+ }
+ 
++export fn ghostty_config_set_font_size(self: *Config, size: f32) void {
++    self.@"font-size" = std.math.clamp(size, 1.0, 255.0);
++}
++
++export fn ghostty_config_set_font_family(
++    self: *Config,
++    str: [*]const u8,
++    len: usize,
++) bool {
++    config_set_font_family_(self, str[0..len]) catch |err| {
++        log.err("error setting font family err={}", .{err});
++        return false;
++    };
++
++    return true;
++}
++
++export fn ghostty_config_font_family_count(self: *const Config) u32 {
++    return @intCast(self.@"font-family".count());
++}
++
++export fn ghostty_config_font_family_get(
++    self: *const Config,
++    idx: u32,
++) ?[*:0]const u8 {
++    const items = self.@"font-family".list.items;
++    if (idx >= items.len) return null;
++    return @ptrCast(items[idx].ptr);
++}
++
+ export fn ghostty_config_get(
+     self: *Config,
+     ptr: *anyopaque,
+@@ -111,6 +141,25 @@ fn config_trigger_(
+     return trigger.cval();
+ }
+ 
++fn config_set_font_family_(self: *Config, value: []const u8) !void {
++    const alloc = self._arena.?.allocator();
++
++    clearRepeatableString(&self.@"font-family");
++    clearRepeatableString(&self.@"font-family-bold");
++    clearRepeatableString(&self.@"font-family-italic");
++    clearRepeatableString(&self.@"font-family-bold-italic");
++
++    if (value.len == 0) return;
++
++    const copy = try alloc.dupeZ(u8, value);
++    try self.@"font-family".list.append(alloc, copy);
++}
++
++fn clearRepeatableString(value: *Config.RepeatableString) void {
++    value.list.clearRetainingCapacity();
++    value.overwrite_next = false;
++}
++
+ export fn ghostty_config_diagnostics_count(self: *Config) u32 {
+     return @intCast(self._diagnostics.items().len);
+ }
+@@ -135,3 +184,38 @@ export fn ghostty_config_open_path() c.String {
+ const Diagnostic = extern struct {
+     message: [*:0]const u8 = "",
+ };
++
++test "c_api: set font family overwrites style-specific families" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var config = try Config.default(alloc);
++    defer config.deinit();
++
++    try config.@"font-family-bold".parseCLI(alloc, "Old Bold");
++    try config.@"font-family-italic".parseCLI(alloc, "Old Italic");
++
++    try testing.expect(ghostty_config_set_font_family(&config, "SF Mono", "SF Mono".len));
++    try testing.expectEqual(@as(u32, 1), ghostty_config_font_family_count(&config));
++    try testing.expectEqualStrings(
++        "SF Mono",
++        std.mem.sliceTo(ghostty_config_font_family_get(&config, 0).?, 0),
++    );
++    try testing.expectEqual(@as(usize, 0), config.@"font-family-bold".count());
++    try testing.expectEqual(@as(usize, 0), config.@"font-family-italic".count());
++    try testing.expectEqual(@as(usize, 0), config.@"font-family-bold-italic".count());
++}
++
++test "c_api: set font size clamps input" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var config = try Config.default(alloc);
++    defer config.deinit();
++
++    ghostty_config_set_font_size(&config, 0.5);
++    try testing.expectEqual(@as(f32, 1), config.@"font-size");
++
++    ghostty_config_set_font_size(&config, 512);
++    try testing.expectEqual(@as(f32, 255), config.@"font-size");
++}
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 168f54c2b..478aa0510 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -72,8 +72,14 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+     const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
+     errdefer queue.release();
+ 
+-    const default_storage_mode: mtl.MTLResourceOptions.StorageMode =
+-        if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed;
++    // iOS Metal does not support `.managed` storage mode at all (the
++    // simulator asserts with "Invalid storageMode 1"). Force `.shared` on
++    // iOS, which is the only valid mode there. On macOS, fall back to
++    // `.managed` only when the device lacks unified memory.
++    const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
++        .ios => .shared,
++        else => if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed,
++    };
+ 
+     const ViewInfo = struct {
+         view: objc.Object,
+@@ -114,7 +120,12 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+         },
+ 
+         .ios => {
+-            info.view.msgSend(void, objc.sel("addSublayer"), .{layer.layer.value});
++            // UIView's `layer` is read-only and always present, so we add our
++            // Metal layer as a sublayer of the view's existing CALayer.
++            // `addSublayer:` (with the colon — the unary form sent direct to
++            // a UIView crashes with "unrecognized selector").
++            const view_layer = info.view.getProperty(objc.Object, "layer");
++            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
+         },
+ 
+         else => @compileError("unsupported target for Metal"),
+diff --git a/src/termio.zig b/src/termio.zig
+index b16885109..e2860fe2a 100644
+--- a/src/termio.zig
++++ b/src/termio.zig
+@@ -23,6 +23,7 @@ const message = @import("termio/message.zig");
+ pub const backend = @import("termio/backend.zig");
+ pub const mailbox = @import("termio/mailbox.zig");
+ pub const Exec = @import("termio/Exec.zig");
++pub const Host = @import("termio/Host.zig");
+ pub const Options = @import("termio/Options.zig");
+ pub const Termio = @import("termio/Termio.zig");
+ pub const Thread = @import("termio/Thread.zig");
+diff --git a/src/termio/backend.zig b/src/termio/backend.zig
+index ae0e2004f..85b730065 100644
+--- a/src/termio/backend.zig
++++ b/src/termio/backend.zig
+@@ -10,28 +10,32 @@ const termio = @import("../termio.zig");
+ const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+ 
+ /// The kinds of backends.
+-pub const Kind = enum { exec };
++pub const Kind = enum { exec, host };
+ 
+ /// Configuration for the various backend types.
+ pub const Config = union(Kind) {
+     /// Exec uses posix exec to run a command with a pty.
+     exec: termio.Exec.Config,
++    host: termio.Host.Config,
+ };
+ 
+ /// Backend implementations. A backend is responsible for owning the pty
+ /// behavior and providing read/write capabilities.
+ pub const Backend = union(Kind) {
+     exec: termio.Exec,
++    host: termio.Host,
+ 
+     pub fn deinit(self: *Backend) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(),
++            .host => |*host| host.deinit(),
+         }
+     }
+ 
+     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
+         switch (self.*) {
+             .exec => |*exec| exec.initTerminal(t),
++            .host => |*host| host.initTerminal(t),
+         }
+     }
+ 
+@@ -43,12 +47,14 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.threadEnter(alloc, io, td),
++            .host => |*host| try host.threadEnter(alloc, io, td),
+         }
+     }
+ 
+     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
+         switch (self.*) {
+             .exec => |*exec| exec.threadExit(td),
++            .host => |*host| host.threadExit(td),
+         }
+     }
+ 
+@@ -59,6 +65,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.focusGained(td, focused),
++            .host => |*host| try host.focusGained(td, focused),
+         }
+     }
+ 
+@@ -69,6 +76,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.resize(grid_size, screen_size),
++            .host => |*host| try host.resize(grid_size, screen_size),
+         }
+     }
+ 
+@@ -81,6 +89,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
++            .host => |*host| try host.queueWrite(alloc, td, data, linefeed),
+         }
+     }
+ 
+@@ -98,6 +107,12 @@ pub const Backend = union(Kind) {
+                 exit_code,
+                 runtime_ms,
+             ),
++            .host => |*host| try host.childExitedAbnormally(
++                gpa,
++                t,
++                exit_code,
++                runtime_ms,
++            ),
+         }
+     }
+ };
+@@ -105,10 +120,12 @@ pub const Backend = union(Kind) {
+ /// Termio thread data. See termio.ThreadData for docs.
+ pub const ThreadData = union(Kind) {
+     exec: termio.Exec.ThreadData,
++    host: termio.Host.ThreadData,
+ 
+     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(alloc),
++            .host => |*host| host.deinit(alloc),
+         }
+     }
+ 
